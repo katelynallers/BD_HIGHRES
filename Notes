@@ -1,0 +1,17 @@
+1. Copy FITS spectra into Data directory
+2. Use gtmap2.py to perform AMOEBA fitting over logg-T grid.
+
+./gtmap3.py -h # to look at options
+./gtmap3.py ./Data/2MJ0103+19_order36trial2.fits # run with defaults
+(creates initialization files for MCMC)
+
+3. Use dreamzsBD8.py to perform MCMC
+
+./dreamzsBD8.py -h # to look at options
+# Example run:
+./dreamzsBD8.py ./Data/2MJ0103+19_order36trial2.fits --niter 30000 --nchains 3
+
+--pton for parallel tempering
+--fsys 0.1  would add 10% systematic uncertainty (default is zero)
+
+4. Plotting makePlots8.py (for a single source and order); makeBoxPlots8.py (for a single source, multiple orders)
