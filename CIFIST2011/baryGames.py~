@@ -1,4 +1,0 @@
-from PyAstronomy.pyasl import baryvel
-import pyfits
-
-h = pyfits.getheader('VB10_comb.fits')
