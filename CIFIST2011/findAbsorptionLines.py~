@@ -1,0 +1,74 @@
+from pylab import *
+from pyfits import getdata
+import warnings
+warnings.simplefilter('ignore', RankWarning)
+import sys
+
+x, y = loadtxt('transmissionCurve.txt',unpack=True)
+
+aStarData = getdata('2M2224-01_tell.fits')
+# filter bad region, copy to more readable variables
+xStar = aStarData[0,:]
+idx = xStar > 2.274
+xStar = xStar[idx]
+yStar = aStarData[1,idx]
+eStar = aStarData[2,idx]
+# note: I'm finding scatter of ~ 5%
+# I'll add it in quadrature
+eStar = sqrt(eStar**2 + (0.05*yStar)**2)
+
+
+def mexicanHat(x, sigma=1.0):
+    x2 = x**2
+    s2 = sigma**2
+    y = 2.0 / sqrt(3.0*sigma*sqrt(pi)) * (1-x2/s2)*exp(-x2/2.0/s2)
+    return y
+
+from scipy.interpolate import interp1d
+ks = mexicanHat(arange(-60,61),sigma=3.0)
+kc = mexicanHat(arange(-60,61),sigma=6.0)
+
+def corsum(p):
+    xs = polyval(p, arange(len(yStar)))
+    x0 = amin(xs)
+    x1 = amax(xs)
+    # get the spectra onto the same grid
+    idx = x >= x0
+    xc = x[idx]
+    yc = y[idx]
+    idx = xc <= x1
+    xc = xc[idx]
+    yc = yc[idx]
+    print x0, x1, xc[0], xc[-1]
+    starFunc = interp1d(xs, yStar)
+    ys = starFunc(xc)
+    ysmh = convolve(ys, ks, 'same')
+    ymh = convolve(yc, kc, 'same')
+    return -sum(ysmh*ymh)
+
+
+
+p0 = array([0., 0., -1.69365791436e-14, 6.13196305699e-05, 2.15733135502])
+from scipy.optimize import fmin
+p = fmin(corsum, p0)
+xs = polyval(p, arange(len(yStar)))
+x0 = amin(xs)
+x1 = amax(xs)
+# get the spectra onto the same grid
+idx = x >= x0
+xc = x[idx]
+yc = y[idx]
+idx = xc <= x1
+xc = xc[idx]
+yc = yc[idx]
+starFunc = interp1d(xs, yStar)
+ys = starFunc(xc)
+ysmh = convolve(ys, ks, 'same')
+ymh = convolve(yc, kc, 'same')
+clf()
+plot(xc, ysmh)
+plot(xc, ymh)
+
+
+
+

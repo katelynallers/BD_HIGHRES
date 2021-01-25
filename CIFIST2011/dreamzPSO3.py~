@@ -1,0 +1,392 @@
+#!/usr/bin/env python
+from pyfits import getdata
+from matplotlib.pyplot import clf, plot, axes, savefig
+from numpy import inf, loadtxt, exp, log, logical_and, sqrt, copy
+from numpy import median, array, zeros, ones, linspace, arange
+from numpy import amin, amax, pi, ceil, isnan, polyfit, polyval
+from numpy import isinf, diff, all, RankWarning, average, std
+from numpy import shape, any
+from numpy.random import normal, uniform
+from gzip import open as zopen
+from dreamZPT.wrapper import DREAMZS
+from CIFIST2011 import btsettlFunction as proto
+
+import warnings
+warnings.simplefilter('ignore', RankWarning)
+from scipy.interpolate import BarycentricInterpolator, \
+    InterpolatedUnivariateSpline
+from scipy.signal import gaussian
+from scipy.ndimage.filters import gaussian_filter1d, convolve1d, \
+    uniform_filter1d
+from astropy.convolution import convolve_fft, convolve
+import sys
+from time import time
+
+bestscore = -inf
+
+suffix = 'allModels'
+
+debug = False
+c = 299792.458
+bandLow = 2.1
+bandHigh = 2.40
+
+# load transmission curve
+xtransg, ytransg = loadtxt('transmissionCurve.txt', unpack=True)
+idx = logical_and(xtransg > 0.9*bandLow, xtransg < 1.1*bandHigh)
+xtransg = xtransg[idx]
+ytransg = ytransg[idx]
+dltransg = xtransg[1] - xtransg[0]
+
+# load model atmosphere
+def expDtofloat(s): # deal with FORTRAN "D"s *shiver*
+    return float(s.replace('D', 'E'))
+
+# convenience: calculate velocity grid outside of model function
+l0 = log(amin(proto.protoW))
+l1 = log(amax(proto.protoW))
+mwlVgrid = exp(linspace(l0, l1, len(proto.protoW)*10)) # 10 times oversampled
+vpix = c * median((mwlVgrid[1:] - mwlVgrid[:-1]) / mwlVgrid[1:])
+
+aStarData, hdr = getdata('PSOJ318_comb.fits', header=True)
+# filter bad region, copy to more readable variables
+'''
+xStar = aStarData[0,:]
+idx = logical_and(xStar >= 2.274, xStar <= 2.326)
+xStar = xStar[idx]
+yStar = aStarData[1,idx]
+errStar = aStarData[2,idx]
+'''
+# no filter
+xStar = aStarData[0,:]
+yStar = aStarData[1,:]
+errStar = aStarData[2,:]
+
+# note: I'm finding residual scatter of ~ 10%
+# I'll add it in quadrature
+#sysUnc = 0.10
+#eStar = sqrt((sysUnc*yStar)**2 + errStar**2)
+eStar = errStar
+sysUnc = 0.0
+
+resolvingPower = hdr['RP'] * 1.0
+hdrFWHM = median(xStar) / resolvingPower
+
+#hdrDispersion = hdr['DISPO01']
+
+
+'''
+lsf_rotate adapted from idlastro code of the same name.
+'''
+
+def lsf_rotate(deltav, vsini, epsilon=0.6):  
+    e1 = 2.0 * (1.0 - epsilon)
+    e2 = pi * epsilon / 2.0
+    e3 = pi * (1.0 - epsilon / 3.0)
+    npts = int(ceil(2.0 * vsini / deltav))
+    if npts % 2 == 0: 
+        npts += 1
+    nwid = npts / 2
+    xx = arange(npts) - 1.0*nwid
+    xx *= deltav / vsini
+    velgrid = xx * vsini
+    x1 = abs(1.0 - xx*xx)
+    return velgrid, (e1*sqrt(x1) + e2 * x1)/e3
+
+def weighAnchor(nGrid, anchors):
+    nOrder = len(anchors)
+    xx = array(linspace(0.,1.,nOrder)*(nGrid-1)).astype(int)
+    return xx
+
+def strictly_increasing(xx):
+    dx = diff(xx)
+    return all(dx > 0)
+
+def logPrior(p):
+    penalty = 0.0
+    if not strictly_increasing(p[6:]):
+        return -inf
+    if p[0] <= 0.0: # don't want a negative LSF
+        return -inf
+    if p[1] <= 0.0: # don't want negative power scaling of transmission
+        return -inf
+    if p[2] <= 0.0: # don't want a negative rotation speed
+        return -inf
+    if p[4] > 26. or p[4] < 12.: # tGrid
+        return -inf
+    if p[5] < 3.5 or p[5] > 5.5: # gGrid
+        return -inf
+    if p[6] <= 2.0: # keep things in the K-band
+        return -inf
+    if p[-1] >= 2.5:
+        return -inf
+    return penalty
+
+def xgridFromAnchors(nGrid, p):
+    anchors = p[6:]
+    pivots = weighAnchor(nGrid, anchors)
+    x = BarycentricInterpolator(pivots,anchors)(arange(nGrid))
+    return x
+
+def extractTransmissionCurve(p, xtransg=xtransg, ytransg=ytransg):
+    fwhm = p[0]
+    xmin = p[6]
+    xmax = p[-1]
+    idx = logical_and(xtransg >= xmin-3.0*fwhm, xtransg <= xmax+3.0*fwhm)
+    return xtransg[idx], ytransg[idx]
+
+def model(p, y=yStar):
+    nGrid = len(yStar)
+    # calibrate wavelength scale given parameters
+    x = xgridFromAnchors(nGrid, p)
+    # get the model atmosphere spectrum
+    mfw = proto.protoW
+    mfl = proto.protoFunction(p[4], p[5])
+    ''' 
+    Create the lsf convolution function
+    '''
+    # move the following to the model
+    mflVgrid = InterpolatedUnivariateSpline(mfw, mfl, k=3)(mwlVgrid)
+    '''
+    # resample to uniform velocity grid
+    l0 = log(amin(mwl))
+    l1 = log(amax(mwl))
+    mwlVgrid = exp(linspace(l0, l1, len(mwl)*3)) # 3 times oversampled
+    mflVgrid = interp1d(mwl, mfl,bounds_error=False, \
+                            fill_value=0.0)(mwlVgrid)
+    
+    # create the lsf kernel
+    vpix = c * (mwlVgrid[1] - mwlVgrid[0]) / mwlVgrid[1]
+    '''
+    velgrid, lsf = lsf_rotate(vpix, p[2])
+    if p[2] > vpix:
+        '''
+        t1 = time()
+        mflVgridC = convolve(mflVgrid, lsf, normalize_kernel=True)
+        print 'convolve ', t1 - time()
+
+        t1 = time()
+        mflVgridC = convolve_fft(mflVgrid, lsf, normalize_kernel=True)
+        print 'convolve_fft', t1 - time()
+        # convolve1d is a factor of 10 faster
+        '''
+        #t1 = time()
+        mflVgridC = convolve1d(mflVgrid, lsf, mode='nearest')
+        #print 'convolve1d', t1 - time()
+    else:
+        mflVgridC = copy(mflVgrid)
+    # shift model to observer's reference frame
+    mwlVgridS = mwlVgrid * (1.0 + p[3] / c) 
+
+    # Resample sky to model wavelength grid
+    yyg = InterpolatedUnivariateSpline(xtransg, ytransg, k=3)(mwlVgridS)
+    stp1 = yyg**p[1]
+    model0 = stp1 * mflVgridC
+
+    # Resample to over-sampled data grid
+    xos = linspace(amin(x), amax(x), len(x)*10) # 10 times oversampled
+    dxos = xos[1] - xos[0]
+
+    model0 = InterpolatedUnivariateSpline(mwlVgridS, model0)(xos)
+    
+    # smooth (transmission * model)
+    # p[0] is actually fwhm in microns
+    sigma = p[0] / dxos / 2.355
+
+    '''
+    t1 = time()
+    M = int(10*ceil(sigma) + 1)
+    kernel = gaussian(M, sigma)
+    if (kernel.sum() <= 0.0):
+        print 'Bad sigma kernel!'
+        print 'M = ', M
+        print 'p[0] = ', p[0]
+        print 'dltransg = ', dltransg
+        print 'sigma = ', sigma
+        model1 = 0.0 * x
+        return model1
+    
+    if any(isnan(kernel)) or any(isnan(model0)):
+        return -inf
+    model1 = convolve_fft(model0, kernel, normalize_kernel=True)
+    #model1 = convolve(model0, kernel, normalize_kernel=True)
+    print 'astropy: ', time() - t1
+    # gaussian_filter1d is much fast, factor of 10
+    '''
+
+    #t1 = time()
+    model1 = gaussian_filter1d(model0, sigma)
+    #print 'filter1d: ', time() - t1
+
+    # interpolate back to data grid
+
+    try: # check if the wavelength solution is running away
+        # model2 = interp1d(xxg, model1)(x) 
+        model2 = InterpolatedUnivariateSpline(xos, \
+                                                 model1, k=2)(x) 
+    except:
+        model2 = 0.0 * x
+        return -inf
+
+    temp = y / model2
+
+    if any(isnan(temp)) or any(isinf(temp)):
+        return -inf
+
+    '''
+    temp = polyfit(x, convolve_fft(temp, ones(11), \
+                                   normalize_kernel=True), 3)
+    temp = polyfit(x, convolve(temp, ones(21), \
+                               normalize_kernel=True), 3)
+    '''
+    temp = polyfit(x, uniform_filter1d(temp, 21, mode='nearest'), 3)
+
+    pyfit = polyval(temp, x)
+    model3 = pyfit * model2
+    scale = median(y) / median(model3)
+    model3 *= scale
+
+    return model3
+
+def modelLogP(p, y=yStar, e=eStar, sysUnc=sysUnc):
+    global bestscore
+    m = model(p, y=y)
+    z = (y-m) / e
+    fracErr = abs(y-m)/m
+    idx = fracErr < sysUnc
+    z[idx] = 1.0
+    logp = -sum(z*z)/2.0
+    if isinf(logp) or isnan(logp): logp = -inf
+    if logp > bestscore:
+        bestscore = logp
+        print -2.0*bestscore, p
+    #print logp, p
+    #print -2.0 * logp, p
+    return logp
+
+#Initialize Z array
+bestFit = array([
+        1.68625340e-04, 
+        9.44633141e-01,
+        4.25085513e+00, 
+        2.42769449e+01, 13.0, 4.5, 
+        xStar[0],
+        median(xStar),
+        xStar[-1]
+        ])
+
+#print modelLogP(bestFit)
+
+
+eps = 1.e-6
+
+ndim = len(bestFit)
+nchains = 3
+ninit = 10*ndim
+if debug == True:
+    niter = 30
+else:
+    niter = 10000
+thin = 10
+Z = zeros((ninit, ndim))
+#sys.exit()    
+variation = ones(ndim) * 0.001 # 0.1% variation, initially
+#variation[2] = 0.1
+#variation[3] = 0.1
+dx = xStar[1] - xStar[0]
+for i in range(ninit):
+    #zp = -inf
+    #while isinf(zp):
+    p = bestFit # just to get the shape; I'm overriding this
+    #p[0] = bestFit[0] * (1.0 + 0.4 * uniform() - 0.2)
+    p[0] = 0.1*dx + uniform()*(2.9*dx) # 1-10 times the pixel separation
+    p[1] = bestFit[1] * (1.0 + 0.6 * uniform() - 0.3)
+    p[2] = uniform() * (30.-vpix) + vpix
+    p[3] = uniform() * 50. -25.0
+    p[4] = uniform() * (26. - 12.) + 12.
+    p[5] = uniform() * (5.5 - 3.5) + 3.5
+    p[6] = xStar[0] + normal() * 2.0 * bestFit[0]
+    p[7] = xStar[len(xStar)/2] + normal() * 2.0 * bestFit[0]
+    p[8] = xStar[-1] + normal() * 2.0 * bestFit[0]
+    #zp = modelLogP(p) + logPrior(p)
+    #print p, zp
+    #print 'i, zp = ', i, zp
+    Z[i] = p
+
+
+Z, ZP, successVec = DREAMZS(Z, modelLogP, logPrior, 3, niter, thin=10, ncr=3, \
+                    navg = 4, args=(yStar, eStar, sysUnc))
+    
+# save the results
+fp = zopen('PSOResults/PSOJ318_' + suffix + '_dreamzTryResults.txt.gz', 'w')
+nsamp, ndim = shape(Z)
+for i in range(nsamp):
+    for j in range(ndim):
+        print >>fp, Z[i][j],
+    print >>fp, ZP[i]
+fp.close()
+
+# plot the model
+p = Z[-1]
+x = xgridFromAnchors(len(yStar), p)
+m = model(p)
+clf()
+plot(x, yStar)
+plot(x, m)
+
+clf()
+left, width = 0.1, 0.8
+bottom0, height0 = 0.1, 0.3
+bottom1, height1 = bottom0+height0, 0.9 - bottom0-height0
+
+spect = axes([left, bottom1, width, height1])
+resid = axes([left, bottom0, width, height0])
+
+resid.plot(x, yStar - m,'.')
+resid.set_xlabel('Wavelength ($\\mu$m)')
+resid.set_ylabel('Residuals')
+#resid.set_yticks([-40,-20,0,20,40])
+g = resid.get_xticklabels()
+
+spect.plot(x, yStar, 'k')
+spect.plot(x, m, 'r')
+spect.set_xticklabels(g,visible=False)
+spect.set_ylabel('Model Fit')
+#spect.set_yticks(arange(400,800,50))
+
+
+savefig('PSOResults/PSOJ318_' + suffix + '_ModelFit.png')
+savefig('PSOResults/PSOJ318_' + suffix + '_ModelFit.pdf')
+
+# generate a wavelength-calibrated spectrum
+# compile wavelength grids
+from dreamZPT.diagnostics import autoburn
+burn = autoburn(ZP)
+ZP = ZP[burn:]
+Z = Z[burn:]
+nsamp = len(Z)
+xgrid = zeros((nsamp, len(x)))
+for i in range(nsamp):
+    p = Z[i]
+    x = xgridFromAnchors(len(yStar), p)
+    xgrid[i] = x
+
+meanXgrid = average(xgrid, axis=0)
+stdXgrid = std(xgrid, axis=0)
+
+fp = open('PSOResults/PSOJ318_' + suffix + '_calibratedSpectrum.txt', 'w')
+print >>fp, '# wavelength, error, flux, error'
+for i in range(len(x)):
+    print >>fp, meanXgrid[i], stdXgrid[i], yStar[i], errStar[i]
+fp.close()
+
+'''
+Results (w/o 10% systematic uncertainty scaling)
+LSF = 0.1933 +/- 0.0014 nm
+Line depth scaling = 0.949 +/- 0.031
+vsini = 5.8 +/- 2.3 km/s
+cz = 24.13 +/- 0.58 km/s
+lambda_0 = 2.2739711 +/- 0.0000058 microns
+lambda_1 = 2.2999770 +/- 0.0000048 microns
+lambda_2 = 2.3258715 +/- 0.0000088 microns
+'''

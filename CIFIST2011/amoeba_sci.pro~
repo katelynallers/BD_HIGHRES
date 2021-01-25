@@ -1,0 +1,100 @@
+function sci_fit_amoeba, par
+
+common scistruct, struct
+
+;print, par
+
+pfit=poly_fit(struct.x_anchor, par[4:*], n_elements(par[4:*])-1.0)
+sciwl=poly(findgen(n_elements(struct.sciwl)), pfit)
+scifl=struct.scifl
+scifle=struct.scifle
+swl=struct.swl
+stp=struct.stp
+mwl=struct.mwl * (1.0 + (par[3]/299792.458)) ;shift the model by the velocity p[3]
+mfl=struct.mfl
+
+;create the lsf convolution function:
+ln_resample, mwl, mfl, model_wl, mfl_rs, os=10, shift=0 
+n=n_elements(model_wl)
+vpix=median((model_wl[1:n-1]-model_wl[0:n-2])/model_wl[1:n-1]*2.99792E5)
+par[2] >= vpix ;(if negative value, then make this equal to vpix)
+lsf=lsf_rotate(vpix, par[2], VELGRID=vel)
+mfl_cv=convol(mfl_rs, lsf, /edge_truncate) ;convolve the atmo model by the LSF
+
+stp_rs=interpol(stp, swl, model_wl, /spline)^par[1] ;resample and scale the sky too.
+
+model1=gaussfold(model_wl, stp_rs*mfl_cv, par[0])
+
+model2=interpol(model1, model_wl, sciwl, /quadratic) ;now, put the model on the science wavelength grid
+
+pfit=poly_fit(sciwl, smooth(scifl/model2,20), 3, yfit=pyfit, /double, status=status)
+model3=model2*pyfit
+scale=median(scifl)/median(model3)
+model3*=scale
+
+return, total((scifl-model3)^2/(scifle)^2)
+end
+
+function amoeba_sci, model=model
+
+;model file is the location of the atmospheric model save file, which
+;must inclue mwl (in microns) and mfl
+
+common scistruct, struct
+
+;Note must have run amoeba_tell.pro to get initial guesses...
+restore, 'amoeba_tellparms.sav'
+
+;Note using forward modelling here.  Fitting the wl solution, LSF,
+;vsini and observed velocity
+p=dblarr(7) ;p[0] is LSF (FWHM in microns), p[1]= Line depth scaling (tau), p[2]=broadening, p[3]=RV, p[4-6] = wavelengths of first, middle, and last pixels
+p[0]=ptell_best[0]
+p[1]=ptell_best[1]
+p[2]=15.0
+p[3]=28.1 ;v_helio
+
+sci=readfits('PSOJ318/PSOJ318_comb.fits', scihdr)
+;get rid of bad region [2.265-2.274 and >2.326]
+gnirs_good=between(sci[*,0], 2.274, 2.326)
+sci=temporary(sci[gnirs_good,*])
+
+n_anchor = n_elements(p[4:*]) ; get the order for the polynomial fit
+x_anchor = findgen(n_anchor)/float(n_anchor-1)*float(n_elements(gnirs_good)-1) ;get the anchor point (min wl, max wl, and in between)
+wl_anchor = sci[x_anchor, 0] + (ptell_best[2:*]-ptell_0[2:*]) ;get the wavelengths for the anchors, adjust according to offsets found for telluric fit compared to spectrum file.
+p[4:*]=wl_anchor
+
+;read in sky transmission data
+rdfloat, 'transdata_1_5_mic', wn, stp 
+swl=1.e4/wn
+krange=between(swl, 2.26, 2.34);Let's just grab the K band
+swl=temporary(swl[krange])
+stp=temporary(stp[krange])
+
+;read in atmospheric model
+;readcol, 'lte016-3.5-0.0a+0.0.BT-Settl.spec.7', wl_ang, logfl, format='F,D'
+;mwl=wl_ang/10000. & mfl=10.0^logfl
+;krange=between(mwl, 2.26, 2.34) ;Let's just grab the K band
+;mwl=temporary(mwl[krange])
+;mfl=temporary(mfl[krange])
+
+IF keyword_set(model) THEN restore, model  ELSE restore, 'lte016-3.5-0.0a+0.0.BT-Settl.spec.7.sav'
+
+struct = {sciwl:sci[*,0], scifl:sci[*,1], scifle:sci[*,2], swl:swl, stp:stp, x_anchor:x_anchor, mwl:mwl, mfl:mfl}
+
+scale=[ 0.2*p[0], 0.3*p[1], 10.0, 50.0, p[0]*3.0, p[0]*3.0, p[0]*3.0]
+
+pbest=amoeba(0.02,function_name='sci_fit_amoeba', p0=p, scale=scale)
+;pbest=amoeba(0.005,function_name='sci_fit_amoeba', p0=p, scale=scale)
+
+;print, "Original parameters:"
+;print, p
+;print, "Final parameters:"
+;print, pbest
+
+p0=p
+chi2=sci_fit_amoeba(pbest)
+save, filename='amoeba_sciparms.sav', pbest, struct, p0, chi2
+
+return, chi2
+
+end
